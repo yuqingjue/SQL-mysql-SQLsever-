@@ -1,0 +1,449 @@
+# 初始化Dash应用
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app.title = "金价与电商发货延迟分析看板"
+
+# 定义布局
+app.layout = dbc.Container([
+    # 标题和说明
+    dbc.Row([
+        dbc.Col([
+            html.H1("金价与电商黄金卖家发货延迟分析看板", 
+                   className="text-center mb-4",
+                   style={'color': '#2c3e50', 'fontWeight': 'bold'}),
+            html.P("分析金价波动与电商平台黄金卖家发货延迟之间的关系",
+                  className="text-center text-muted mb-4")
+        ])
+    ]),
+    
+    # 时间范围选择和控制面板
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardBody([
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("选择时间范围:", className="font-weight-bold"),
+                            dcc.DatePickerRange(
+                                id='date-picker-range',
+                                start_date=gold_df['date'].min(),
+                                end_date=gold_df['date'].max(),
+                                display_format='YYYY-MM-DD',
+                                className="mb-3"
+                            )
+                        ], md=4),
+                        dbc.Col([
+                            html.Label("技术指标:", className="font-weight-bold"),
+                            dcc.Dropdown(
+                                id='tech-indicator-selector',
+                                options=[
+                                    {'label': '移动平均线', 'value': 'MA'},
+                                    {'label': 'MACD', 'value': 'MACD'},
+                                    {'label': 'RSI', 'value': 'RSI'},
+                                    {'label': '布林带', 'value': 'BB'},
+                                    {'label': 'ATR', 'value': 'ATR'}
+                                ],
+                                value=['MA'],
+                                multi=True,
+                                className="mb-3"
+                            )
+                        ], md=4),
+                        dbc.Col([
+                            html.Label("延迟指标:", className="font-weight-bold"),
+                            dcc.Dropdown(
+                                id='delay-metric-selector',
+                                options=[
+                                    {'label': '未发货比例', 'value': 'not_shipped_ratio'},
+                                    {'label': '轻微延迟比例', 'value': 'minor_delay_ratio'},
+                                    {'label': '严重延迟比例', 'value': 'major_delay_ratio'},
+                                    {'label': '总延迟比例', 'value': 'total_delay'}
+                                ],
+                                value='major_delay_ratio',
+                                className="mb-3"
+                            )
+                        ], md=4)
+                    ])
+                ])
+            ], className="mb-4")
+        ])
+    ]),
+    
+    # 主要图表区域 - 金价与延迟联动展示
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader([
+                    html.H4("金价走势与发货延迟关系", className="mb-0"),
+                    html.Small("点击图表上的点查看详细信息", className="text-muted")
+                ]),
+                dbc.CardBody([
+                    dcc.Graph(id='gold-delay-combined-chart')
+                ])
+            ], className="mb-4")
+        ])
+    ]),
+    
+    # 技术指标和详细分析选项卡
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader([
+                    dbc.Tabs([
+                        dbc.Tab(label="技术指标详情", tab_id="tab-technical"),
+                        dbc.Tab(label="发货延迟分析", tab_id="tab-delay"),
+                        dbc.Tab(label="相关性分析", tab_id="tab-correlation"),
+                        dbc.Tab(label="事件时间线", tab_id="tab-events"),
+                    ], id="analysis-tabs", active_tab="tab-technical"),
+                ]),
+                dbc.CardBody([
+                    html.Div(id="analysis-tab-content")
+                ])
+            ])
+        ])
+    ]),
+    
+    # 关键指标卡片
+    dbc.Row([
+        dbc.Col([dbc.Card([dbc.CardBody([html.H5("当前金价"), html.H3(id="current-price", className="text-success")])])], md=3),
+        dbc.Col([dbc.Card([dbc.CardBody([html.H5("金价波动率"), html.H3(id="price-volatility", className="text-info")])])], md=3),
+        dbc.Col([dbc.Card([dbc.CardBody([html.H5("平均延迟率"), html.H3(id="avg-delay-ratio", className="text-warning")])])], md=3),
+        dbc.Col([dbc.Card([dbc.CardBody([html.H5("延迟事件数"), html.H3(id="delay-events-count", className="text-danger")])])], md=3),
+    ], className="mb-4"),
+    
+    # 数据表格
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader(html.H5("详细数据")),
+                dbc.CardBody([
+                    dcc.Dropdown(
+                        id='data-type-selector',
+                        options=[
+                            {'label': '金价数据', 'value': 'gold'},
+                            {'label': '卖家数据', 'value': 'seller'},
+                            {'label': '延迟事件', 'value': 'events'}
+                        ],
+                        value='gold',
+                        className="mb-3"
+                    ),
+                    html.Div(id="data-table-container")
+                ])
+            ])
+        ])
+    ])
+], fluid=True)
+# 回调函数 - 更新主要图表
+@app.callback(
+    Output('gold-delay-combined-chart', 'figure'),
+    [Input('date-picker-range', 'start_date'),
+     Input('date-picker-range', 'end_date'),
+     Input('tech-indicator-selector', 'value'),
+     Input('delay-metric-selector', 'value')]
+)
+def update_combined_chart(start_date, end_date, tech_indicators, delay_metric):
+    # 过滤数据
+    mask = (gold_df['date'] >= start_date) & (gold_df['date'] <= end_date)
+    filtered_gold = gold_df[mask].copy()
+    filtered_seller = seller_df[mask].copy()
+    
+    # 创建子图
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        subplot_titles=('金价走势与技术指标', '发货延迟情况'),
+        row_heights=[0.7, 0.3]
+    )
+    
+    # 金价蜡烛图
+    fig.add_trace(
+        go.Candlestick(
+            x=filtered_gold['date'],
+            open=filtered_gold['open'],
+            high=filtered_gold['high'],
+            low=filtered_gold['low'],
+            close=filtered_gold['close'],
+            name='金价'
+        ),
+        row=1, col=1
+    )
+    
+    # 技术指标
+    if 'MA' in tech_indicators:
+        fig.add_trace(go.Scatter(x=filtered_gold['date'], y=filtered_gold['ema5'], 
+                               name='EMA5', line=dict(color='orange', width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=filtered_gold['date'], y=filtered_gold['ema20'], 
+                               name='EMA20', line=dict(color='red', width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=filtered_gold['date'], y=filtered_gold['sma50'], 
+                               name='SMA50', line=dict(color='blue', width=2)), row=1, col=1)
+    
+    if 'BB' in tech_indicators and 'upper_band' in filtered_gold.columns:
+        fig.add_trace(go.Scatter(x=filtered_gold['date'], y=filtered_gold['upper_band'], 
+                               name='上轨', line=dict(color='gray', dash='dash'), opacity=0.7), row=1, col=1)
+        fig.add_trace(go.Scatter(x=filtered_gold['date'], y=filtered_gold['lower_band'], 
+                               name='下轨', line=dict(color='gray', dash='dash'), opacity=0.7,
+                               fill='tonexty'), row=1, col=1)
+    
+    # 延迟指标
+    if delay_metric == 'total_delay':
+        delay_values = (filtered_seller['minor_delay_ratio'] + filtered_seller['major_delay_ratio'])
+        delay_name = '总延迟比例'
+    else:
+        delay_values = filtered_seller[delay_metric]
+        delay_name = {
+            'not_shipped_ratio': '未发货比例',
+            'minor_delay_ratio': '轻微延迟比例', 
+            'major_delay_ratio': '严重延迟比例'
+        }[delay_metric]
+    
+    fig.add_trace(
+        go.Scatter(
+            x=filtered_seller['date'],
+            y=delay_values,
+            name=delay_name,
+            line=dict(color='red', width=2),
+            fill='tozeroy',
+            opacity=0.6
+        ),
+        row=2, col=1
+    )
+    
+    # 标记关键事件
+    events_mask = (events_df['date'] >= start_date) & (events_df['date'] <= end_date)
+    filtered_events = events_df[events_mask]
+    
+    for _, event in filtered_events.iterrows():
+        fig.add_vline(
+            x=event['date'], 
+            line_dash="dash", 
+            line_color="red",
+            opacity=0.5,
+            row=1, col=1
+        )
+        fig.add_annotation(
+            x=event['date'], y=filtered_gold[filtered_gold['date'] == event['date']]['high'].max(),
+            text=f"延迟事件<br>{event['type']}",
+            showarrow=True,
+            arrowhead=2,
+            row=1, col=1
+        )
+    
+    # 更新布局
+    fig.update_layout(
+        height=600,
+        xaxis_rangeslider_visible=False,
+        showlegend=True,
+        hovermode='x unified'
+    )
+    
+    fig.update_yaxes(title_text="价格 (USD)", row=1, col=1)
+    fig.update_yaxes(title_text="延迟比例 (%)", row=2, col=1)
+    fig.update_xaxes(title_text="日期", row=2, col=1)
+    
+    return fig
+
+# 回调函数 - 更新分析选项卡内容
+@app.callback(
+    Output('analysis-tab-content', 'children'),
+    [Input('analysis-tabs', 'active_tab'),
+     Input('date-picker-range', 'start_date'),
+     Input('date-picker-range', 'end_date')]
+)
+def update_analysis_tab(active_tab, start_date, end_date):
+    mask = (gold_df['date'] >= start_date) & (gold_df['date'] <= end_date)
+    filtered_gold = gold_df[mask].copy()
+    filtered_seller = seller_df[mask].copy()
+    
+    if active_tab == "tab-technical":
+        return create_technical_analysis(filtered_gold)
+    elif active_tab == "tab-delay":
+        return create_delay_analysis(filtered_seller)
+    elif active_tab == "tab-correlation":
+        return create_correlation_analysis(filtered_gold, filtered_seller)
+    elif active_tab == "tab-events":
+        return create_events_timeline(filtered_gold, filtered_seller)
+    
+    return html.Div("请选择一个选项卡")
+
+def create_technical_analysis(gold_data):
+    # 创建技术指标图表
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=('MACD', 'RSI', '布林带', '波动率指标'),
+        vertical_spacing=0.1,
+        horizontal_spacing=0.1
+    )
+    
+    # MACD
+    fig.add_trace(go.Scatter(x=gold_data['date'], y=gold_data['macd'], name='MACD', line=dict(color='blue')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=gold_data['date'], y=gold_data['macd_signal'], name='信号线', line=dict(color='red')), row=1, col=1)
+    fig.add_trace(go.Bar(x=gold_data['date'], y=gold_data['macd_hist'], name='MACD柱', marker_color='gray'), row=1, col=1)
+    
+    # RSI
+    fig.add_trace(go.Scatter(x=gold_data['date'], y=gold_data['rsi14'], name='RSI', line=dict(color='purple')), row=1, col=2)
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=1, col=2)
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=1, col=2)
+    
+    # 布林带
+    fig.add_trace(go.Scatter(x=gold_data['date'], y=gold_data['close'], name='收盘价', line=dict(color='black')), row=2, col=1)
+    fig.add_trace(go.Scatter(x=gold_data['date'], y=gold_data['upper_band'], name='上轨', line=dict(color='gray', dash='dash')), row=2, col=1)
+    fig.add_trace(go.Scatter(x=gold_data['date'], y=gold_data['lower_band'], name='下轨', line=dict(color='gray', dash='dash'), fill='tonexty'), row=2, col=1)
+    
+    # ATR
+    fig.add_trace(go.Scatter(x=gold_data['date'], y=gold_data['atr14'], name='ATR', line=dict(color='orange')), row=2, col=2)
+    
+    fig.update_layout(height=600, showlegend=True)
+    
+    return dcc.Graph(figure=fig)
+
+def create_delay_analysis(seller_data):
+    # 发货间隔分布堆叠面积图
+    interval_cols = ['0_days', '1_days', '2_days', '3_days', '4_days', '5_days', '5_10_days', 'over_10_days']
+    interval_labels = ['0天', '1天', '2天', '3天', '4天', '5天', '5-10天', '>10天']
+    
+    fig1 = go.Figure()
+    for i, col in enumerate(interval_cols):
+        fig1.add_trace(go.Scatter(
+            x=seller_data['date'],
+            y=seller_data[col],
+            name=interval_labels[i],
+            stackgroup='one'
+        ))
+    
+    fig1.update_layout(title='发货间隔分布', height=300)
+    
+    # 延迟比例对比
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=seller_data['date'], y=seller_data['not_shipped_ratio'], name='未发货比例', line=dict(color='red')))
+    fig2.add_trace(go.Scatter(x=seller_data['date'], y=seller_data['minor_delay_ratio'], name='轻微延迟', line=dict(color='orange')))
+    fig2.add_trace(go.Scatter(x=seller_data['date'], y=seller_data['major_delay_ratio'], name='严重延迟', line=dict(color='purple')))
+    fig2.update_layout(title='延迟比例对比', height=300)
+    
+    return html.Div([
+        dbc.Row([
+            dbc.Col(dcc.Graph(figure=fig1), md=6),
+            dbc.Col(dcc.Graph(figure=fig2), md=6)
+        ])
+    ])
+
+def create_correlation_analysis(gold_data, seller_data):
+    # 合并数据计算相关性
+    merged_data = pd.merge(gold_data, seller_data, on='date', how='inner')
+    
+    # 计算价格变化率
+    merged_data['price_change'] = merged_data['close'].pct_change() * 100
+    merged_data['price_volatility'] = merged_data['close'].rolling(5).std()
+    
+    # 相关性矩阵
+    corr_metrics = ['price_change', 'price_volatility', 'not_shipped_ratio', 'minor_delay_ratio', 'major_delay_ratio']
+    corr_data = merged_data[corr_metrics].corr()
+    
+    fig1 = go.Figure(data=go.Heatmap(
+        z=corr_data.values,
+        x=corr_data.columns,
+        y=corr_data.index,
+        colorscale='RdBu',
+        zmin=-1, zmax=1,
+        text=corr_data.round(3).values,
+        texttemplate="%{text}",
+        hoverinfo="none"
+    ))
+    
+    fig1.update_layout(title='金价指标与延迟指标相关性矩阵', height=400)
+    
+    # 散点图展示关系
+    fig2 = px.scatter(merged_data, x='price_change', y='major_delay_ratio', 
+                     trendline="ols", title='金价变化率 vs 严重延迟比例')
+    
+    return html.Div([
+        dbc.Row([
+            dbc.Col(dcc.Graph(figure=fig1), md=6),
+            dbc.Col(dcc.Graph(figure=fig2), md=6)
+        ])
+    ])
+
+def create_events_timeline(gold_data, seller_data):
+    # 创建事件时间线
+    events_mask = (events_df['date'] >= gold_data['date'].min()) & (events_df['date'] <= gold_data['date'].max())
+    filtered_events = events_df[events_mask]
+    
+    fig = go.Figure()
+    
+    # 金价背景
+    fig.add_trace(go.Scatter(
+        x=gold_data['date'], 
+        y=gold_data['close'],
+        name='金价',
+        line=dict(color='lightgray'),
+        yaxis='y1'
+    ))
+    
+    # 事件标记
+    for _, event in filtered_events.iterrows():
+        fig.add_trace(go.Scatter(
+            x=[event['date']],
+            y=[gold_data[gold_data['date'] == event['date']]['close'].values[0]],
+            mode='markers+text',
+            name=event['type'],
+            marker=dict(size=15, symbol='star'),
+            text=[f"{event['type']}: {event['value']:.1f}%"],
+            textposition="top center"
+        ))
+    
+    fig.update_layout(
+        title='延迟事件时间线',
+        height=400,
+        showlegend=True
+    )
+    
+    return dcc.Graph(figure=fig)
+
+# 回调函数 - 更新关键指标卡片
+@app.callback(
+    [Output('current-price', 'children'),
+     Output('price-volatility', 'children'),
+     Output('avg-delay-ratio', 'children'),
+     Output('delay-events-count', 'children')],
+    [Input('date-picker-range', 'start_date'),
+     Input('date-picker-range', 'end_date')]
+)
+def update_key_metrics(start_date, end_date):
+    mask = (gold_df['date'] >= start_date) & (gold_df['date'] <= end_date)
+    filtered_gold = gold_df[mask].copy()
+    filtered_seller = seller_df[mask].copy()
+    filtered_events = events_df[mask].copy()
+    
+    current_price = f"${filtered_gold['close'].iloc[-1]:.2f}" if len(filtered_gold) > 0 else "N/A"
+    price_volatility = f"{filtered_gold['close'].pct_change().std()*100:.2f}%" if len(filtered_gold) > 1 else "N/A"
+    avg_delay = f"{filtered_seller['major_delay_ratio'].mean():.1f}%" if len(filtered_seller) > 0 else "N/A"
+    events_count = f"{len(filtered_events)}" if len(filtered_events) > 0 else "0"
+    
+    return current_price, price_volatility, avg_delay, events_count
+
+# 回调函数 - 更新数据表格
+@app.callback(
+    Output('data-table-container', 'children'),
+    [Input('data-type-selector', 'value'),
+     Input('date-picker-range', 'start_date'),
+     Input('date-picker-range', 'end_date')]
+)
+def update_data_table(data_type, start_date, end_date):
+    mask = (gold_df['date'] >= start_date) & (gold_df['date'] <= end_date)
+    
+    if data_type == 'gold':
+        data = gold_df[mask][['date', 'open', 'high', 'low', 'close', 'volume', 'rsi14', 'macd']]
+    elif data_type == 'seller':
+        data = seller_df[mask][['date', 'total_volume', 'not_shipped_ratio', 'minor_delay_ratio', 'major_delay_ratio']]
+    else:
+        data = events_df[mask]
+    
+    # 创建数据表格
+    table = dbc.Table.from_dataframe(
+        data.round(3).head(100),  # 限制显示行数
+        striped=True,
+        bordered=True,
+        hover=True,
+        responsive=True,
+        className="mt-3"
+    )
+    
+    return table
