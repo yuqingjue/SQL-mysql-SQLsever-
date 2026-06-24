@@ -1,7 +1,7 @@
 import pandas as pd
 import json
 import dash
-from dash import html, dcc, Input, Output, State,dash_table
+from dash import html, dcc, Input, Output, State, dash_table
 import dash_cytoscape as cyto
 
 
@@ -104,6 +104,9 @@ def build_table_elements(tables, flows):
     edges = []
     seen = set()
     for _, row in flows.iterrows():
+        # 过滤掉源或目标为空的非法行
+        if pd.isna(row['SourceTable']) or pd.isna(row['TargetTable']):
+            continue
         pair = (row['SourceTable'], row['TargetTable'])
         if pair not in seen:
             seen.add(pair)
@@ -127,6 +130,8 @@ def build_field_view_elements(tables, flows, expansions=None):
     table_fields = {}
     for _, row in flows.iterrows():
         src_tbl, tgt_tbl = row['SourceTable'], row['TargetTable']
+        if pd.isna(src_tbl) or pd.isna(tgt_tbl):
+            continue
         src_f, tgt_f = row['SourceField'], row['TargetField']
         table_fields.setdefault(src_tbl, set()).add(src_f)
         table_fields.setdefault(tgt_tbl, set()).add(tgt_f)
@@ -202,12 +207,20 @@ def build_field_view_elements(tables, flows, expansions=None):
 
         x_cursor += col_width + col_gap
 
+    # =============== 修改重点：Edge ID 增加行索引以唯一化 ===============
     for _, row in flows.iterrows():
-        src_id = f"{row['SourceTable']}.{row['SourceField']}"
-        tgt_id = f"{row['TargetTable']}.{row['TargetField']}"
+        src_tbl, tgt_tbl = row['SourceTable'], row['TargetTable']
+        if pd.isna(src_tbl) or pd.isna(tgt_tbl):
+            continue
+        src_id = f"{src_tbl}.{row['SourceField']}"
+        tgt_id = f"{tgt_tbl}.{row['TargetField']}"
+        
+        # 利用 row.name (Pandas行索引) 确保即便源字段相同，Edge ID 也绝对唯一
+        unique_edge_id = f"edge_{row.name}_{src_id}_to_{tgt_id}"
+        
         field_edges.append({
             'data': {
-                'id': f"{src_id}_to_{tgt_id}",
+                'id': unique_edge_id,
                 'source': src_id,
                 'target': tgt_id,
                 'label': row.get('Rule', '')
@@ -383,7 +396,8 @@ def toggle_view(n_clicks, current_mode, dfs_dict, expansions):
         elements = build_field_view_elements(tables, flows, expansions)
         edit_style = {'display': 'none'}
         field_style = {'display': 'block', 'padding': 10, 'border': '1px solid #ccc', 'borderRadius': 5}
-        return (elements, field_stylesheet, {'name': 'preset', 'fit': True, 'padding': 60},
+        # =========== 修改重点：列级视图改为 'cose' 布局，防止连线重叠 ===========
+        return (elements, field_stylesheet, {'name': 'cose', 'idealEdgeLength': 100, 'fit': True, 'padding': 60},
                 'field', 'Current: Column-level View', 'Switch to Table-level View',
                 "Click a connection to view its generation rule", '', edit_style, field_style)
     else:
@@ -600,7 +614,7 @@ def save_field_rule(n_clicks, new_rule, selected_edge, dfs_dict, view_mode):
         steps_df = steps
         new_dfs = {'tables': tables.to_dict('records'), 'flows': flows.to_dict('records'), 'steps': steps.to_dict('records')}
         elements = build_field_view_elements(tables, flows)
-        return 'Rule saved!', new_dfs, elements, field_stylesheet, {'name': 'preset', 'fit': True, 'padding': 60}
+        return 'Rule saved!', new_dfs, elements, field_stylesheet, {'name': 'cose', 'idealEdgeLength': 100, 'fit': True, 'padding': 60}
     except Exception as e:
         return f"Save failed: {str(e)}", dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
@@ -692,7 +706,7 @@ def expand_table(node_data, view_mode, expansions, dfs_dict):
     tables = pd.DataFrame(dfs_dict['tables'])
     flows = pd.DataFrame(dfs_dict['flows'])
     elements = build_field_view_elements(tables, flows, expansions)
-    return expansions, elements, {'name': 'preset', 'fit': True, 'padding': 60}
+    return expansions, elements, {'name': 'cose', 'idealEdgeLength': 100, 'fit': True, 'padding': 60}
 
 if __name__ == '__main__':
     app.run(debug=True)
