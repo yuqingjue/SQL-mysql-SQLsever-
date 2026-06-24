@@ -1,5 +1,4 @@
 import pandas as pd
-import json
 import dash
 from dash import html, dcc, Input, Output, State, dash_table
 import dash_cytoscape as cyto
@@ -39,7 +38,20 @@ def load_metadata(path):
 
     for sheet in sheet_names:
         df = pd.read_excel(xls, sheet_name=sheet, header=None)
-        info = dict(zip(df.iloc[0, :5].tolist(), df.iloc[1, :5].tolist()))
+        
+        # 读取元数据，清理首尾空格
+        info_vals = df.iloc[0, :5].tolist()
+        data_vals = df.iloc[1, :5].tolist()
+        info = {}
+        for k, v in zip(info_vals, data_vals):
+            if isinstance(k, str): 
+                k = k.strip()
+            if isinstance(v, str): 
+                v = v.strip()
+            info[k] = v
+        
+        # 【核心】强制用 Sheet 名作为标准节点名
+        info['TableName'] = sheet 
         tables_data.append(info)
 
         # 步骤块
@@ -56,7 +68,7 @@ def load_metadata(path):
                 step_df.insert(0, 'TargetTable', info['TableName'])
                 steps_list.append(step_df)
 
-        # 字段映射块
+        # 字段映射块（唯一用于生成连线）
         flow_start = None
         for i in range(len(df)):
             if df.iloc[i, 0] == "SourceTable":
@@ -68,6 +80,12 @@ def load_metadata(path):
             if flow_data:
                 flow_df = pd.DataFrame(flow_data, columns=flow_headers)
                 flow_df.insert(0, 'TargetTable', info['TableName'])
+                
+                # 清理表名空格
+                flow_df['SourceTable'] = flow_df['SourceTable'].astype(str).str.strip()
+                flow_df['TargetTable'] = flow_df['TargetTable'].astype(str).str.strip()
+                # 过滤掉步骤别名
+                flow_df = flow_df[flow_df['SourceTable'] != '(previous)']
                 flows_list.append(flow_df)
 
     tables_df = pd.DataFrame(tables_data)
@@ -77,58 +95,42 @@ def load_metadata(path):
     flows_df = pd.concat(flows_list, ignore_index=True) if flows_list else pd.DataFrame(
         columns=["SourceTable", "SourceField", "TargetTable", "TargetField", "Rule", "Notes"])
 
-    # 双向补全反向映射
-    complementary = []
-    for _, row in flows_df.iterrows():
-        rev = flows_df[(flows_df['SourceTable'] == row['TargetTable']) &
-                       (flows_df['SourceField'] == row['TargetField']) &
-                       (flows_df['TargetTable'] == row['SourceTable']) &
-                       (flows_df['TargetField'] == row['SourceField'])]
-        if rev.empty:
-            complementary.append({
-                'SourceTable': row['TargetTable'],
-                'SourceField': row['TargetField'],
-                'TargetTable': row['SourceTable'],
-                'TargetField': row['SourceField'],
-                'Rule': row.get('Rule', ''),
-                'Notes': row.get('Notes', '')
-            })
-    if complementary:
-        flows_df = pd.concat([flows_df, pd.DataFrame(complementary)], ignore_index=True)
-
+    # 彻底移除双向补全逻辑，严格单向
     return tables_df, flows_df, steps_df
 
 tables_df, flows_df, steps_df = load_metadata(EXCEL_PATH)
 
-# ==================== 表级图元素（修复：自动补全所有出现过的表节点）====================
+# ==================== 表级图元素 ====================
 def build_table_elements(tables, flows):
-    # 收集所有出现过的表名（源表 + 目标表）
+    # 收集所有出现的表名
     all_tables = set(tables['TableName'].dropna().tolist())
     all_tables.update(flows['SourceTable'].dropna().tolist())
     all_tables.update(flows['TargetTable'].dropna().tolist())
 
-    # 已定义的表保留原元数据
     table_info_map = {row['TableName']: row for _, row in tables.iterrows()}
 
     nodes = []
+    # 创建缩写映射字典
+    node_lookup = {}
     for tbl in all_tables:
         info = table_info_map.get(tbl, {})
-        category = info.get('Category', 'source')  # 未在Excel中定义的表默认归为源表
-        nodes.append({
-            'data': {
-                'id': tbl,
-                'label': tbl,
-                'category': category
-            }
-        })
+        category = info.get('Category', 'source')
+        nodes.append({'data': {'id': tbl, 'label': tbl, 'category': category}})
+        node_lookup[tbl] = tbl
+        node_lookup[tbl.split('.')[-1]] = tbl
 
     edges = []
     seen = set()
     for _, row in flows.iterrows():
-        src = row.get('SourceTable')
-        tgt = row.get('TargetTable')
-        if pd.isna(src) or pd.isna(tgt):
+        raw_src = str(row.get('SourceTable', '')).strip()
+        raw_tgt = str(row.get('TargetTable', '')).strip()
+        if not raw_src or not raw_tgt:
             continue
+        
+        # 映射到标准节点
+        src = node_lookup.get(raw_src, raw_src)
+        tgt = node_lookup.get(raw_tgt, raw_tgt)
+        
         pair = (src, tgt)
         if pair not in seen:
             seen.add(pair)
@@ -144,53 +146,59 @@ def build_step_dict(steps_df):
 
 step_dict = build_step_dict(steps_df)
 
-# ==================== 列级图元素（修复：自动补全缺失表节点 + 安全获取分类）====================
+# ==================== 列级图元素 ====================
 MAX_VISIBLE_FIELDS = 8
 
 def build_field_view_elements(tables, flows, expansions=None):
     if expansions is None:
         expansions = {}
 
-    # 收集所有出现过的表名
+    # 收集所有表名并构建映射
     all_table_names = set(tables['TableName'].dropna().tolist())
     all_table_names.update(flows['SourceTable'].dropna().tolist())
     all_table_names.update(flows['TargetTable'].dropna().tolist())
+    
+    node_lookup = {}
+    for tbl in all_table_names:
+        node_lookup[tbl] = tbl
+        node_lookup[tbl.split('.')[-1]] = tbl
 
-    # 构建表分类映射
     table_category_map = {row['TableName']: row.get('Category', 'source') for _, row in tables.iterrows()}
 
     # 收集每个表的所有字段
     table_fields = {}
     for _, row in flows.iterrows():
-        src_tbl = row.get('SourceTable')
-        tgt_tbl = row.get('TargetTable')
-        if pd.isna(src_tbl) or pd.isna(tgt_tbl):
+        raw_src = str(row.get('SourceTable', '')).strip()
+        raw_tgt = str(row.get('TargetTable', '')).strip()
+        if not raw_src or not raw_tgt:
             continue
+        src_tbl = node_lookup.get(raw_src, raw_src)
+        tgt_tbl = node_lookup.get(raw_tgt, raw_tgt)
         src_f = row.get('SourceField', '')
         tgt_f = row.get('TargetField', '')
         table_fields.setdefault(src_tbl, set()).add(src_f)
         table_fields.setdefault(tgt_tbl, set()).add(tgt_f)
 
-    # 确保所有表都在字典中（即使没有字段）
-    for tbl in all_table_names:
+    # 确保每个表都有占位
+    for tbl in set(node_lookup.values()):
         if tbl not in table_fields:
             table_fields[tbl] = set()
 
     col_width = 150
-    col_gap = 40
-    field_height = 28
+    col_gap = 200
+    field_height =32
     field_gap = 8
-    start_x = 40
+    start_x = 100
     start_y = 60
-    header_height = 80
+    header_height = 120
 
     parent_nodes = []
     field_nodes = []
     field_edges = []
     x_cursor = start_x
 
-    # 遍历所有表（含自动补全的表）
-    for tbl_name in sorted(all_table_names):
+    # 生成节点
+    for tbl_name in sorted(set(node_lookup.values())):
         all_fields = sorted(list(table_fields.get(tbl_name, [])))
         total = len(all_fields)
         expanded = expansions.get(tbl_name, False)
@@ -207,15 +215,23 @@ def build_field_view_elements(tables, flows, expansions=None):
         parent_height = header_height + n * field_height + (n - 1) * field_gap + 30 + extra_height
         parent_width = col_width
 
+# 修改后
         parent_nodes.append({
             'data': {
                 'id': tbl_name,
                 'label': tbl_name,
                 'category': table_category_map.get(tbl_name, 'source'),
+                # 不再需要 width/height
+            },
+            'position': {'x': x_cursor, 'y': start_y},
+            'style': {
                 'width': parent_width,
                 'height': parent_height,
-            },
-            'position': {'x': x_cursor, 'y': start_y}
+                # 以下为原有样式，可自由调整颜色
+                'shape': 'round-rectangle',
+                'background-color': '#e8f4f8',
+                'border-width': 0,
+            }
         })
 
         for i, field in enumerate(visible_fields):
@@ -246,19 +262,25 @@ def build_field_view_elements(tables, flows, expansions=None):
 
         x_cursor += col_width + col_gap
 
-    # 生成字段级连线
+    # 生成连线（绝对单向，利用 row.name 确保同名源字段连线不丢）
     for _, row in flows.iterrows():
-        src_tbl = row.get('SourceTable')
-        src_f = row.get('SourceField')
-        tgt_tbl = row.get('TargetTable')
-        tgt_f = row.get('TargetField')
-        if pd.isna(src_tbl) or pd.isna(src_f) or pd.isna(tgt_tbl) or pd.isna(tgt_f):
+        raw_src = str(row.get('SourceTable', '')).strip()
+        raw_tgt = str(row.get('TargetTable', '')).strip()
+        src_f = row.get('SourceField', '')
+        tgt_f = row.get('TargetField', '')
+        
+        if not raw_src or not raw_tgt or not src_f or not tgt_f:
             continue
+        
+        src_tbl = node_lookup.get(raw_src, raw_src)
+        tgt_tbl = node_lookup.get(raw_tgt, raw_tgt)
+        
         src_id = f"{src_tbl}.{src_f}"
         tgt_id = f"{tgt_tbl}.{tgt_f}"
+        
         field_edges.append({
             'data': {
-                'id': f"{src_id}_to_{tgt_id}",
+                'id': f"edge_{row.name}_{src_id}_to_{tgt_id}",
                 'source': src_id,
                 'target': tgt_id,
                 'label': row.get('Rule', '')
@@ -269,130 +291,41 @@ def build_field_view_elements(tables, flows, expansions=None):
 
 # ==================== 样式表 ====================
 base_stylesheet = [
-    {
-        'selector': 'node',
-        'style': {
-            'label': 'data(label)',
-            'shape': 'round-rectangle',
-            'width': 'label',
-            'height': 'label',
-            'padding': '12px',
-            'text-valign': 'center',
-            'text-halign': 'center',
-            'font-size': '14px',
-            'font-weight': 'bold',
-            'color': '#2c3e50',
-            'text-wrap': 'wrap',
-            'text-max-width': '180px',
-            'border-width': 0,
-            'background-color': '#e8f4f8',
-        }
-    },
+    {'selector': 'node', 'style': {'label': 'data(label)', 'shape': 'round-rectangle', 'width': 'label', 'height': 'label', 'padding': '12px', 'text-valign': 'center', 'text-halign': 'center', 'font-size': '14px', 'font-weight': 'bold', 'color': '#2c3e50', 'text-wrap': 'wrap', 'text-max-width': '180px', 'border-width': 0, 'background-color': '#e8f4f8'}},
     {'selector': '[category = "source"]', 'style': {'background-color': '#AEE2FF'}},
     {'selector': '[category = "process"]', 'style': {'background-color': '#B5EAD7'}},
     {'selector': '[category = "datastore"]', 'style': {'background-color': '#C3E0E5'}},
     {'selector': '[category = "destination"]', 'style': {'background-color': '#A9C6D9'}},
-    {
-        'selector': 'edge',
-        'style': {
-            'target-arrow-shape': 'triangle',
-            'curve-style': 'bezier',
-            'line-color': '#7f8c8d',
-            'target-arrow-color': '#7f8c8d'
-        }
-    },
+    {'selector': 'edge', 'style': {'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'line-color': '#7f8c8d', 'target-arrow-color': '#7f8c8d'}},
 ]
-
 field_stylesheet = [
-    {
-        'selector': 'node',
-        'style': {
-            'label': 'data(label)',
-            'shape': 'round-rectangle',
-            'width': 'data(width)',
-            'height': 'data(height)',
-            'padding': '5px',
-            'text-valign': 'top',
-            'text-halign': 'center',
-            'font-size': '16px',
-            'font-weight': 'bold',
-            'color': '#2c3e50',
-            'border-width': 0,
-            'background-color': '#e8f4f8',
-        }
-    },
+    {'selector': 'node', 'style': {'label': 'data(label)', 'shape': 'round-rectangle', 'width': 'data(width)', 'height': 'data(height)', 'padding': '5px', 'text-valign': 'top', 'text-halign': 'center', 'font-size': '16px', 'font-weight': 'bold', 'color': '#2c3e50', 'border-width': 0, 'background-color': '#e8f4f8'}},
     {'selector': '[category = "source"]', 'style': {'background-color': '#AEE2FF'}},
     {'selector': '[category = "process"]', 'style': {'background-color': '#B5EAD7'}},
     {'selector': '[category = "datastore"]', 'style': {'background-color': '#C3E0E5'}},
     {'selector': '[category = "destination"]', 'style': {'background-color': '#A9C6D9'}},
-    {
-        'selector': 'node[parent]',
-        'style': {
-            'shape': 'round-rectangle',
-            'width': 130,
-            'height': 28,
-            'background-color': '#ffffff',
-            'border-width': 1,
-            'border-color': '#A9CCE3',
-            'font-size': '12px',
-            'text-valign': 'center',
-            'text-halign': 'center',
-            'label': 'data(label)',
-            'color': '#2c3e50',
-        }
-    },
-    {
-        'selector': 'edge',
-        'style': {
-            'width': 1.5,
-            'line-color': '#0074D9',
-            'target-arrow-shape': 'triangle',
-            'target-arrow-color': '#0074D9',
-            'font-size': '8px',
-            'curve-style': 'bezier'
-        }
-    },
-    {
-        'selector': 'edge:selected',
-        'style': {
-            'line-color': '#0074D9',
-            'target-arrow-color': '#0074D9',
-            'width': 2,
-            'overlay-color': '#00BFFF',
-            'overlay-opacity': 0.5,
-            'overlay-padding': 4
-        }
-    },
+    {'selector': 'node[parent]', 'style': {'shape': 'round-rectangle', 'width': 130, 'height': 28, 'background-color': '#ffffff', 'border-width': 1, 'border-color': '#A9CCE3', 'font-size': '12px', 'text-valign': 'center', 'text-halign': 'center', 'label': 'data(label)', 'color': '#2c3e50'}},
+    {'selector': 'edge', 'style': {'width': 1.5, 'line-color': '#0074D9', 'target-arrow-shape': 'triangle', 'target-arrow-color': '#0074D9', 'font-size': '8px', 'curve-style': 'bezier'}},
+    {'selector': 'edge:selected', 'style': {'line-color': '#0074D9', 'target-arrow-color': '#0074D9', 'width': 2, 'overlay-color': '#00BFFF', 'overlay-opacity': 0.5, 'overlay-padding': 4}},
 ]
 
-# ==================== 保存到 Excel ====================
+# ==================== 写入 Excel ====================
 def write_to_excel(tables, flows, steps, path):
     from openpyxl import Workbook
     wb = Workbook()
     wb.remove(wb.active)
-
     step_groups = {}
     for _, row in steps.iterrows():
         tbl = row['TargetTable']
         step_groups.setdefault(tbl, []).append(row)
-
     for _, tbl_row in tables.iterrows():
         tbl_name = tbl_row['TableName']
         ws = wb.create_sheet(title=tbl_name)
-
         info_headers = ["Database", "TableName", "Description", "Category", "UpdateFrequency"]
         ws.append(info_headers)
-        ws.append([
-            tbl_row.get('Database', ''),
-            tbl_row['TableName'],
-            tbl_row.get('Description', ''),
-            tbl_row.get('Category', ''),
-            tbl_row.get('UpdateFrequency', '')
-        ])
+        ws.append([tbl_row.get('Database',''), tbl_row['TableName'], tbl_row.get('Description',''), tbl_row.get('Category',''), tbl_row.get('UpdateFrequency','')])
         ws.append([])
-
-        step_headers = ["Step", "Operation", "MainSource", "JoinTable", "JoinType", "JoinCondition",
-                        "FilterCondition", "WindowFunction", "ETL_Partition", "OutputFields", "Alias"]
+        step_headers = ["Step", "Operation", "MainSource", "JoinTable", "JoinType", "JoinCondition", "FilterCondition", "WindowFunction", "ETL_Partition", "OutputFields", "Alias"]
         ws.append(step_headers)
         tbl_steps = step_groups.get(tbl_name, [])
         for s in tbl_steps:
@@ -400,18 +333,11 @@ def write_to_excel(tables, flows, steps, path):
         if not tbl_steps:
             ws.append([''] * len(step_headers))
         ws.append([])
-
         flow_headers = ["SourceTable", "SourceField", "TargetField", "Rule", "Notes"]
         ws.append(flow_headers)
         tbl_flows = flows[flows['TargetTable'] == tbl_name]
         for _, f in tbl_flows.iterrows():
-            ws.append([
-                f.get('SourceTable', ''),
-                f.get('SourceField', ''),
-                f.get('TargetField', ''),
-                f.get('Rule', ''),
-                f.get('Notes', '')
-            ])
+            ws.append([f.get('SourceTable',''), f.get('SourceField',''), f.get('TargetField',''), f.get('Rule',''), f.get('Notes','')])
     wb.save(path)
 
 # ==================== Dash App ====================
@@ -442,8 +368,8 @@ app.layout = html.Div([
         html.Div(id='save-status'),
     ]),
     html.Div(id='field-info-section', style={'display': 'none', 'padding': 10, 'border': '1px solid #ccc', 'borderRadius': 5}, children=[
-        html.H4("Field Generation Logic (click on the connection/column name to view)"),
-        html.Div(id='field-info-panel', children="Switch to column-level view and click a connection"),
+        html.H4("Field Generation Logic"),
+        html.Div(id='field-info-panel', children="Switch to column-level view"),
         html.Div(id='rule-save-status'),
     ]),
     dcc.Store(id='view-mode', data='table'),
@@ -457,7 +383,7 @@ app.layout = html.Div([
     dcc.Store(id='field-expansions', data={}),
 ])
 
-# ==================== 回调：切换视图 ====================
+# ==================== 回调函数 ====================
 @app.callback(
     Output('graph', 'elements'),
     Output('graph', 'stylesheet'),
@@ -472,55 +398,48 @@ app.layout = html.Div([
     Input('toggle-view-btn', 'n_clicks'),
     State('view-mode', 'data'),
     State('global-dfs', 'data'),
-    State('field-expansions', 'data'),
+    State('field-expansions', 'data')
 )
 def toggle_view(n_clicks, current_mode, dfs_dict, expansions):
-    if n_clicks == 0:
+    if n_clicks == 0: 
         raise dash.exceptions.PreventUpdate
     tables = pd.DataFrame(dfs_dict['tables'])
     flows = pd.DataFrame(dfs_dict['flows'])
-
+    
     if current_mode == 'table':
         elements = build_field_view_elements(tables, flows, expansions)
-        edit_style = {'display': 'none'}
-        field_style = {'display': 'block', 'padding': 10, 'border': '1px solid #ccc', 'borderRadius': 5}
         return (
             elements, field_stylesheet, {'name': 'preset', 'fit': True, 'padding': 60},
             'field', 'Current: Column-level View', 'Switch to Table-level View',
-            "Click a connection to view its generation rule", '', edit_style, field_style
+            "Click a connection to view its rule", '', {'display': 'none'}, 
+            {'display': 'block', 'padding': 10, 'border': '1px solid #ccc', 'borderRadius': 5}
         )
     else:
         elements = build_table_elements(tables, flows)
-        edit_style = {'display': 'block', 'padding': 10, 'border': '1px solid #ccc', 'borderRadius': 5}
-        field_style = {'display': 'none'}
         return (
             elements, base_stylesheet, {'name': 'breadthfirst', 'spacingFactor': 1.2},
             'table', 'Current: Table-level View', 'Switch to Column View',
-            "Switch to column-level view to see field details", '', edit_style, field_style
+            "Switch to column-level view to see field details", '', 
+            {'display': 'block', 'padding': 10, 'border': '1px solid #ccc', 'borderRadius': 5}, 
+            {'display': 'none'}
         )
 
-# ==================== 表级编辑面板 ====================
 @app.callback(
     Output('edit-panel', 'children'),
     Output('expanded-table', 'data'),
     Input('graph', 'tapNodeData'),
     State('view-mode', 'data'),
-    State('global-dfs', 'data'),
+    State('global-dfs', 'data')
 )
 def show_edit_panel(node_data, view_mode, dfs_dict):
-    if view_mode != 'table':
-        return html.P("Switch to table-level view to edit"), dash.no_update
-    if not node_data:
+    if view_mode != 'table' or not node_data: 
         return html.P("Click a table node to edit"), None
     table = node_data['id']
-    if '.' in table and table not in [row['TableName'] for _, row in pd.DataFrame(dfs_dict['tables']).iterrows()]:
-        return html.P("Click a table node to edit"), None
-
     steps = pd.DataFrame(dfs_dict['steps'])
     flows = pd.DataFrame(dfs_dict['flows'])
     step_dict_local = build_step_dict(steps)
     steps_list = step_dict_local.get(table, [])
-
+    
     step_columns = [
         {'name': 'Step', 'id': 'Step', 'editable': True},
         {'name': 'Operation', 'id': 'Operation', 'editable': True},
@@ -531,7 +450,7 @@ def show_edit_panel(node_data, view_mode, dfs_dict):
         {'name': 'FilterCondition', 'id': 'FilterCondition', 'editable': True},
         {'name': 'WindowFunction', 'id': 'WindowFunction', 'editable': True},
         {'name': 'OutputFields', 'id': 'OutputFields', 'editable': True},
-        {'name': 'Alias', 'id': 'Alias', 'editable': True},
+        {'name': 'Alias', 'id': 'Alias', 'editable': True}
     ]
     step_table = dash_table.DataTable(
         id='edit-steps-table',
@@ -541,19 +460,18 @@ def show_edit_panel(node_data, view_mode, dfs_dict):
         row_deletable=True,
         style_table={'overflowX': 'auto', 'width': '100%', 'maxWidth': '100%'},
         style_cell={'textAlign': 'left', 'whiteSpace': 'normal', 'padding': '5px', 'fontSize': '12px', 'minWidth': '80px'},
-        style_header={'backgroundColor': '#f9f9f9', 'fontWeight': 'bold', 'whiteSpace': 'normal'},
-        css=[{'selector': '.dash-spreadsheet td', 'rule': 'border: 1px solid #eee;'}],
+        style_header={'backgroundColor': '#f9f9f9', 'fontWeight': 'bold', 'whiteSpace': 'normal'}
     )
-
+    
     field_columns = [
         {'name': 'Source Table', 'id': 'SourceTable', 'editable': True},
         {'name': 'Source Field', 'id': 'SourceField', 'editable': True},
         {'name': 'Target Field', 'id': 'TargetField', 'editable': True},
         {'name': 'Rule', 'id': 'Rule', 'editable': True},
-        {'name': 'Notes', 'id': 'Notes', 'editable': True},
+        {'name': 'Notes', 'id': 'Notes', 'editable': True}
     ]
     field_mappings_df = flows[flows['TargetTable'] == table]
-    field_data = field_mappings_df[['SourceTable', 'SourceField', 'TargetField', 'Rule', 'Notes']].to_dict('records')
+    field_data = field_mappings_df[['SourceTable','SourceField','TargetField','Rule','Notes']].to_dict('records')
     field_table = dash_table.DataTable(
         id='edit-flows-table',
         columns=field_columns,
@@ -562,22 +480,21 @@ def show_edit_panel(node_data, view_mode, dfs_dict):
         row_deletable=True,
         style_table={'overflowX': 'auto', 'maxWidth': '100%'},
         style_cell={'textAlign': 'left', 'padding': '5px', 'fontSize': '12px'},
-        style_header={'backgroundColor': '#f9f9f9', 'fontWeight': 'bold'},
-        css=[{'selector': '.dash-spreadsheet td', 'rule': 'border: 1px solid #eee;'}],
+        style_header={'backgroundColor': '#f9f9f9', 'fontWeight': 'bold'}
     )
-
+    
     tables = pd.DataFrame(dfs_dict['tables'])
     table_info = tables[tables['TableName'] == table].iloc[0] if not tables[tables['TableName'] == table].empty else None
-
+    
     return html.Div([
         html.H5(f"Editing table: {table}"),
         html.Div([
             html.Div([
                 html.Label("Description"),
-                dcc.Input(id='edit-desc', value=table_info.get('Description', '') if table_info is not None else '', style={'width': '100%'}),
+                dcc.Input(id='edit-desc', value=table_info.get('Description','') if table_info is not None else '', style={'width': '100%'}),
                 html.Br(),
                 html.Label("Category"),
-                dcc.Input(id='edit-category', value=table_info.get('Category', 'process') if table_info is not None else 'process', style={'width': '100%'})
+                dcc.Input(id='edit-category', value=table_info.get('Category','process') if table_info is not None else 'process', style={'width': '100%'})
             ], style={'flex': '1', 'padding': '10px'}),
             html.Div([
                 html.Label("Generation Logic (steps table)"),
@@ -586,12 +503,12 @@ def show_edit_panel(node_data, view_mode, dfs_dict):
             html.Div([
                 html.Label("Field Mapping"),
                 field_table
-            ], style={'flex': '3', 'padding': '10px'}),
+            ], style={'flex': '3', 'padding': '10px'})
         ], style={'display': 'flex', 'flex-wrap': 'wrap'}),
-        html.Button("Save Changes to Excel", id='save-btn', n_clicks=0, style={'marginTop': '15px', 'display': 'block'}),
+        html.Button("Save Changes to Excel", id='save-btn', n_clicks=0, style={'marginTop': '15px', 'display': 'block'})
     ]), table
 
-# ==================== 列级视图点击连线 ====================
+# ==================== 列级视图回调 ====================
 @app.callback(
     Output('field-info-panel', 'children', allow_duplicate=True),
     Output('selected-edge', 'data'),
@@ -600,39 +517,26 @@ def show_edit_panel(node_data, view_mode, dfs_dict):
     prevent_initial_call=True
 )
 def show_field_rule(edge_data, view_mode):
-    if view_mode != 'field':
-        raise dash.exceptions.PreventUpdate
-    if not edge_data:
+    if view_mode != 'field' or not edge_data: 
         return "Click a connection to see its rule", None
-
-    source = edge_data.get('source', '')
-    target = edge_data.get('target', '')
-    rule = edge_data.get('label', 'Directly Pull')
-
+    source, target, rule = edge_data.get('source',''), edge_data.get('target',''), edge_data.get('label','Directly Pull')
     tgt_parts = target.split('.')
-    tgt_table = tgt_parts[0] if len(tgt_parts) > 1 else ''
-    tgt_field = tgt_parts[1] if len(tgt_parts) > 1 else ''
-
+    tgt_table, tgt_field = (tgt_parts[0], tgt_parts[1]) if len(tgt_parts) > 1 else ('', '')
+    
     all_mappings = flows_df[(flows_df['TargetTable'] == tgt_table) & (flows_df['TargetField'] == tgt_field)]
-    unique_sources = set()
-    for _, row in all_mappings.iterrows():
-        unique_sources.add(f"{row['SourceTable']}.{row['SourceField']}")
-
+    unique_sources = {f"{row['SourceTable']}.{row['SourceField']}" for _, row in all_mappings.iterrows()}
     source_items = [html.Li(src) for src in sorted(unique_sources)] if unique_sources else [html.Li("No source mapping found")]
-
-    children = html.Div([
+    
+    return html.Div([
         html.P(f"Target Column: {target}"),
         html.P("Source Columns:"),
         html.Ul(source_items),
         html.Hr(),
         html.Label("Edit Rule for this connection:"),
         dcc.Input(id='edit-rule-input', value=rule, style={'width': '100%'}),
-        html.Button("Save Rule to Excel", id='save-rule-btn', n_clicks=0, style={'marginTop': '10px'}),
-    ])
-    selected = {'id': edge_data.get('id', ''), 'source': source, 'target': target, 'rule': rule}
-    return children, selected
+        html.Button("Save Rule to Excel", id='save-rule-btn', n_clicks=0, style={'marginTop': '10px'})
+    ]), {'id': edge_data.get('id',''), 'source': source, 'target': target, 'rule': rule}
 
-# ==================== 列级视图点击字段节点显示来源 ====================
 @app.callback(
     Output('field-info-panel', 'children', allow_duplicate=True),
     Output('selected-edge', 'data', allow_duplicate=True),
@@ -641,34 +545,25 @@ def show_field_rule(edge_data, view_mode):
     prevent_initial_call=True
 )
 def show_field_source(node_data, view_mode):
-    if view_mode != 'field' or not node_data:
+    if view_mode != 'field' or not node_data: 
         raise dash.exceptions.PreventUpdate
-    node_id = node_data.get('id', '')
-    if '.' not in node_id or node_id.endswith('.__more__'):
+    node_id = node_data.get('id','')
+    if '.' not in node_id or node_id.endswith('.__more__'): 
         raise dash.exceptions.PreventUpdate
-
-    parts = node_id.split('.')
-    tgt_table = parts[0]
-    tgt_field = parts[1]
-    target = f"{tgt_table}.{tgt_field}"
-
+    tgt_table, tgt_field = node_id.split('.')[:2]
+    
     all_mappings = flows_df[(flows_df['TargetTable'] == tgt_table) & (flows_df['TargetField'] == tgt_field)]
-    unique_sources = set()
-    for _, row in all_mappings.iterrows():
-        unique_sources.add(f"{row['SourceTable']}.{row['SourceField']}")
-
+    unique_sources = {f"{row['SourceTable']}.{row['SourceField']}" for _, row in all_mappings.iterrows()}
     source_items = [html.Li(src) for src in sorted(unique_sources)] if unique_sources else [html.Li("No source mapping found")]
-
-    children = html.Div([
-        html.P(f"Target Column: {target}"),
+    
+    return html.Div([
+        html.P(f"Target Column: {node_id}"),
         html.P("Source Columns:"),
         html.Ul(source_items),
         html.Hr(),
-        html.P("Click a connection line to edit a rule."),
-    ])
-    return children, None
+        html.P("Click a connection line to edit a rule.")
+    ]), None
 
-# ==================== 保存单字段规则 ====================
 @app.callback(
     Output('rule-save-status', 'children', allow_duplicate=True),
     Output('global-dfs', 'data', allow_duplicate=True),
@@ -683,44 +578,28 @@ def show_field_source(node_data, view_mode):
     prevent_initial_call=True
 )
 def save_field_rule(n_clicks, new_rule, selected_edge, dfs_dict, view_mode):
-    if n_clicks == 0 or not selected_edge or view_mode != 'field':
+    if n_clicks == 0 or not selected_edge or view_mode != 'field': 
         raise dash.exceptions.PreventUpdate
+    tables, flows, steps = pd.DataFrame(dfs_dict['tables']), pd.DataFrame(dfs_dict['flows']), pd.DataFrame(dfs_dict['steps'])
+    src_tbl, src_field = selected_edge['source'].split('.')
+    tgt_tbl, tgt_field = selected_edge['target'].split('.')
+    
+    mask = (flows['SourceTable'] == src_tbl) & (flows['SourceField'] == src_field) & \
+           (flows['TargetTable'] == tgt_tbl) & (flows['TargetField'] == tgt_field)
+    if not mask.any(): 
+        return "Error: Mapping not found", dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    
+    flows.loc[mask, 'Rule'] = new_rule
+    write_to_excel(tables, flows, steps, EXCEL_PATH)
+    
+    global tables_df, flows_df, steps_df
+    tables_df, flows_df, steps_df = tables, flows, steps
+    
+    return ('Rule saved!', 
+            {'tables': tables.to_dict('records'), 'flows': flows.to_dict('records'), 'steps': steps.to_dict('records')},
+            build_field_view_elements(tables, flows), field_stylesheet, 
+            {'name': 'preset','fit': True, 'padding': 60})
 
-    tables = pd.DataFrame(dfs_dict['tables'])
-    flows = pd.DataFrame(dfs_dict['flows'])
-    steps = pd.DataFrame(dfs_dict['steps'])
-
-    source = selected_edge['source']
-    target = selected_edge['target']
-    src_tbl, src_field = source.split('.')
-    tgt_tbl, tgt_field = target.split('.')
-
-    try:
-        mask = (flows['SourceTable'] == src_tbl) & (flows['SourceField'] == src_field) & \
-               (flows['TargetTable'] == tgt_tbl) & (flows['TargetField'] == tgt_field)
-        if mask.any():
-            flows.loc[mask, 'Rule'] = new_rule
-        else:
-            return "Error: Mapping not found", dash.no_update, dash.no_update, dash.no_update, dash.no_update
-
-        write_to_excel(tables, flows, steps, EXCEL_PATH)
-
-        global tables_df, flows_df, steps_df
-        tables_df = tables
-        flows_df = flows
-        steps_df = steps
-
-        new_dfs = {
-            'tables': tables.to_dict('records'),
-            'flows': flows.to_dict('records'),
-            'steps': steps.to_dict('records')
-        }
-        elements = build_field_view_elements(tables, flows)
-        return 'Rule saved!', new_dfs, elements, field_stylesheet, {'name': 'preset', 'fit': True, 'padding': 60}
-    except Exception as e:
-        return f"Save failed: {str(e)}", dash.no_update, dash.no_update, dash.no_update, dash.no_update
-
-# ==================== 保存表级编辑 ====================
 @app.callback(
     Output('save-status', 'children'),
     Output('global-dfs', 'data', allow_duplicate=True),
@@ -738,68 +617,44 @@ def save_field_rule(n_clicks, new_rule, selected_edge, dfs_dict, view_mode):
     prevent_initial_call=True
 )
 def save_table_changes(n_clicks, desc, category, steps_data, flows_data, dfs_dict, expanded_table, view_mode):
-    if n_clicks == 0 or view_mode != 'table' or not expanded_table:
+    if n_clicks == 0 or view_mode != 'table' or not expanded_table: 
         raise dash.exceptions.PreventUpdate
-
-    tables = pd.DataFrame(dfs_dict['tables'])
-    flows = pd.DataFrame(dfs_dict['flows'])
-    steps = pd.DataFrame(dfs_dict['steps'])
+    tables, flows, steps = pd.DataFrame(dfs_dict['tables']), pd.DataFrame(dfs_dict['flows']), pd.DataFrame(dfs_dict['steps'])
     table = expanded_table
+    
+    mask = tables['TableName'] == table
+    if mask.any(): 
+        tables.loc[mask, 'Description'] = desc
+        tables.loc[mask, 'Category'] = category
+    
+    df_steps_new = pd.DataFrame(steps_data) if steps_data else pd.DataFrame(
+        columns=["TargetTable", "Step", "Operation", "MainSource", "JoinTable", "JoinType", 
+                 "JoinCondition", "FilterCondition", "WindowFunction", "OutputFields", "Alias"])
+    if steps_data:
+        for col in ["Step", "Operation", "MainSource", "JoinTable", "JoinType", "JoinCondition", 
+                    "FilterCondition", "WindowFunction", "OutputFields", "Alias"]:
+            if col not in df_steps_new.columns: 
+                df_steps_new[col] = ''
+    df_steps_new['TargetTable'] = table
+    steps = pd.concat([steps[steps['TargetTable'] != table], df_steps_new], ignore_index=True)
+    
+    flows_new_df = pd.DataFrame(flows_data) if flows_data else pd.DataFrame(columns=['SourceTable','SourceField','TargetField','Rule','Notes','TargetTable'])
+    if flows_data:
+        flows_new_df['TargetTable'] = table
+        for col in ['SourceTable','SourceField','TargetField','Rule','Notes']:
+            if col not in flows_new_df.columns: 
+                flows_new_df[col] = ''
+        flows_new_df = flows_new_df.dropna(subset=['SourceTable', 'TargetField'])
+    flows = pd.concat([flows[flows['TargetTable'] != table], flows_new_df], ignore_index=True)
+    
+    write_to_excel(tables, flows, steps, EXCEL_PATH)
+    new_dfs = {'tables': tables.to_dict('records'), 'flows': flows.to_dict('records'), 'steps': steps.to_dict('records')}
+    
+    global tables_df, flows_df, steps_df
+    tables_df, flows_df, steps_df = tables, flows, steps
+    
+    return ("Save successful!", new_dfs, build_table_elements(tables, flows), base_stylesheet, {'name': 'breadthfirst'})
 
-    try:
-        mask = tables['TableName'] == table
-        if mask.any():
-            tables.loc[mask, 'Description'] = desc
-            tables.loc[mask, 'Category'] = category
-
-        if steps_data:
-            df_steps_new = pd.DataFrame(steps_data)
-            for col in ["Step", "Operation", "MainSource", "JoinTable", "JoinType", "JoinCondition",
-                        "FilterCondition", "WindowFunction", "OutputFields", "Alias"]:
-                if col not in df_steps_new.columns:
-                    df_steps_new[col] = ''
-            df_steps_new['TargetTable'] = table
-        else:
-            df_steps_new = pd.DataFrame(columns=[
-                "TargetTable", "Step", "Operation", "MainSource", "JoinTable", "JoinType",
-                "JoinCondition", "FilterCondition", "WindowFunction", "OutputFields", "Alias"
-            ])
-
-        steps = steps[steps['TargetTable'] != table]
-        steps = pd.concat([steps, df_steps_new], ignore_index=True)
-
-        if flows_data:
-            flows_new_df = pd.DataFrame(flows_data)
-            flows_new_df['TargetTable'] = table
-            for col in ['SourceTable', 'SourceField', 'TargetField', 'Rule', 'Notes']:
-                if col not in flows_new_df.columns:
-                    flows_new_df[col] = ''
-            flows_new_df = flows_new_df.dropna(subset=['SourceTable', 'TargetField'])
-        else:
-            flows_new_df = pd.DataFrame(columns=['SourceTable', 'SourceField', 'TargetField', 'Rule', 'Notes', 'TargetTable'])
-
-        flows = flows[flows['TargetTable'] != table]
-        flows = pd.concat([flows, flows_new_df], ignore_index=True)
-
-        write_to_excel(tables, flows, steps, EXCEL_PATH)
-
-        new_dfs = {
-            'tables': tables.to_dict('records'),
-            'flows': flows.to_dict('records'),
-            'steps': steps.to_dict('records')
-        }
-
-        global tables_df, flows_df, steps_df
-        tables_df = tables
-        flows_df = flows
-        steps_df = steps
-
-        elements = build_table_elements(tables, flows)
-        return "Save successful!", new_dfs, elements, base_stylesheet, {'name': 'breadthfirst'}
-    except Exception as e:
-        return f"Save failed: {str(e)}", dash.no_update, dash.no_update, dash.no_update, dash.no_update
-
-# ==================== 列级视图展开更多字段 ====================
 @app.callback(
     Output('field-expansions', 'data'),
     Output('graph', 'elements', allow_duplicate=True),
@@ -811,20 +666,12 @@ def save_table_changes(n_clicks, desc, category, steps_data, flows_data, dfs_dic
     prevent_initial_call=True
 )
 def expand_table(node_data, view_mode, expansions, dfs_dict):
-    if view_mode != 'field' or not node_data:
+    if view_mode != 'field' or not node_data or not node_data['id'].endswith('.__more__'): 
         raise dash.exceptions.PreventUpdate
-    node_id = node_data['id']
-    if not node_id.endswith('.__more__'):
-        raise dash.exceptions.PreventUpdate
-
-    table_name = node_id.split('.')[0]
-    expansions = expansions.copy() if expansions else {}
-    expansions[table_name] = True
-
-    tables = pd.DataFrame(dfs_dict['tables'])
-    flows = pd.DataFrame(dfs_dict['flows'])
-    elements = build_field_view_elements(tables, flows, expansions)
-    return expansions, elements, {'name': 'preset', 'fit': True, 'padding': 60}
+    table_name = node_data['id'].split('.')[0]
+    expansions = {**expansions, table_name: True}
+    tables, flows = pd.DataFrame(dfs_dict['tables']), pd.DataFrame(dfs_dict['flows'])
+    return expansions, build_field_view_elements(tables, flows, expansions), {'name': 'preset', 'fit': True, 'padding': 60}
 
 if __name__ == '__main__':
     app.run(debug=True)
