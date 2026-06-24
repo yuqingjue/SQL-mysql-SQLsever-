@@ -17,12 +17,20 @@ def make_unique_headers(headers):
     return unique
 
 def extract_data_block(df, start_row, stop_marker=None):
+    """稳健解析数据块：遇到空行跳过并继续，保证后续所有数据都被读取。"""
     headers = df.iloc[start_row, :].tolist()
     data = []
     for j in range(start_row + 1, len(df)):
         row = df.iloc[j, :]
-        if pd.isna(row.iloc[0]) or (stop_marker is not None and row.iloc[0] == stop_marker):
+        cell_val = row.iloc[0]
+        
+        if stop_marker is not None and str(cell_val).strip() == stop_marker:
             break
+            
+        # 只有当整行全是空值时，才视为业务空行进行跳过（有效防止有效数据丢失）
+        if row.isnull().all():
+            continue
+            
         data.append(row.tolist())
     return data, headers
 
@@ -39,22 +47,22 @@ def load_metadata(path):
     for sheet in sheet_names:
         df = pd.read_excel(xls, sheet_name=sheet, header=None)
         
-        # 读取元数据，清理首尾空格
         info_vals = df.iloc[0, :5].tolist()
         data_vals = df.iloc[1, :5].tolist()
         info = {}
         for k, v in zip(info_vals, data_vals):
-            if isinstance(k, str): 
-                k = k.strip()
-            if isinstance(v, str): 
-                v = v.strip()
+            if isinstance(k, str): k = k.strip()
+            if isinstance(v, str): v = v.strip()
             info[k] = v
         
-        # 【核心】强制用 Sheet 名作为标准节点名
-        info['TableName'] = sheet 
+        # 强制将 Database 和 TableName 拼接，作为节点的唯一完整 ID
+        db_name = info.get('Database', '').strip()
+        tbl_name = info.get('TableName', sheet).strip()
+        full_tbl_name = f"{db_name}.{tbl_name}" if db_name else tbl_name
+        info['TableName'] = full_tbl_name
         tables_data.append(info)
 
-        # 步骤块
+        # 步骤块（仅用于编辑面板，绝不参与图渲染）
         step_start = None
         for i in range(len(df)):
             if df.iloc[i, 0] == "Step":
@@ -68,7 +76,7 @@ def load_metadata(path):
                 step_df.insert(0, 'TargetTable', info['TableName'])
                 steps_list.append(step_df)
 
-        # 字段映射块（唯一用于生成连线）
+        # 字段映射块（唯一用于生成图的连线）
         flow_start = None
         for i in range(len(df)):
             if df.iloc[i, 0] == "SourceTable":
@@ -81,10 +89,13 @@ def load_metadata(path):
                 flow_df = pd.DataFrame(flow_data, columns=flow_headers)
                 flow_df.insert(0, 'TargetTable', info['TableName'])
                 
-                # 清理表名空格
-                flow_df['SourceTable'] = flow_df['SourceTable'].astype(str).str.strip()
-                flow_df['TargetTable'] = flow_df['TargetTable'].astype(str).str.strip()
-                # 过滤掉步骤别名
+                # 清洗单元格前后空格
+                flow_df['SourceTable'] = flow_df['SourceTable'].apply(lambda x: str(x).strip() if pd.notna(x) else '')
+                flow_df['TargetTable'] = flow_df['TargetTable'].apply(lambda x: str(x).strip() if pd.notna(x) else '')
+                flow_df['SourceField'] = flow_df['SourceField'].apply(lambda x: str(x).strip() if pd.notna(x) else '')
+                flow_df['TargetField'] = flow_df['TargetField'].apply(lambda x: str(x).strip() if pd.notna(x) else '')
+                
+                # 坚决剔除步骤别名产生的干扰
                 flow_df = flow_df[flow_df['SourceTable'] != '(previous)']
                 flows_list.append(flow_df)
 
@@ -95,14 +106,13 @@ def load_metadata(path):
     flows_df = pd.concat(flows_list, ignore_index=True) if flows_list else pd.DataFrame(
         columns=["SourceTable", "SourceField", "TargetTable", "TargetField", "Rule", "Notes"])
 
-    # 彻底移除双向补全逻辑，严格单向
     return tables_df, flows_df, steps_df
 
 tables_df, flows_df, steps_df = load_metadata(EXCEL_PATH)
 
 # ==================== 表级图元素 ====================
 def build_table_elements(tables, flows):
-    # 收集所有出现的表名
+    # 收集所有出现过的表名
     all_tables = set(tables['TableName'].dropna().tolist())
     all_tables.update(flows['SourceTable'].dropna().tolist())
     all_tables.update(flows['TargetTable'].dropna().tolist())
@@ -110,14 +120,10 @@ def build_table_elements(tables, flows):
     table_info_map = {row['TableName']: row for _, row in tables.iterrows()}
 
     nodes = []
-    # 创建缩写映射字典
-    node_lookup = {}
     for tbl in all_tables:
         info = table_info_map.get(tbl, {})
         category = info.get('Category', 'source')
         nodes.append({'data': {'id': tbl, 'label': tbl, 'category': category}})
-        node_lookup[tbl] = tbl
-        node_lookup[tbl.split('.')[-1]] = tbl
 
     edges = []
     seen = set()
@@ -127,11 +133,9 @@ def build_table_elements(tables, flows):
         if not raw_src or not raw_tgt:
             continue
         
-        # 映射到标准节点
-        src = node_lookup.get(raw_src, raw_src)
-        tgt = node_lookup.get(raw_tgt, raw_tgt)
-        
-        pair = (src, tgt)
+        # 【移除容错映射】直接使用 raw_src 和 raw_tgt
+        # 此时 raw_src 必然是 rb_dhub.c_prty，与 nodes 里的 id 完全一致
+        pair = (raw_src, raw_tgt)
         if pair not in seen:
             seen.add(pair)
             edges.append({'data': {'source': pair[0], 'target': pair[1]}})
@@ -153,15 +157,10 @@ def build_field_view_elements(tables, flows, expansions=None):
     if expansions is None:
         expansions = {}
 
-    # 收集所有表名并构建映射
+    # 收集所有表名
     all_table_names = set(tables['TableName'].dropna().tolist())
     all_table_names.update(flows['SourceTable'].dropna().tolist())
     all_table_names.update(flows['TargetTable'].dropna().tolist())
-    
-    node_lookup = {}
-    for tbl in all_table_names:
-        node_lookup[tbl] = tbl
-        node_lookup[tbl.split('.')[-1]] = tbl
 
     table_category_map = {row['TableName']: row.get('Category', 'source') for _, row in tables.iterrows()}
 
@@ -172,21 +171,22 @@ def build_field_view_elements(tables, flows, expansions=None):
         raw_tgt = str(row.get('TargetTable', '')).strip()
         if not raw_src or not raw_tgt:
             continue
-        src_tbl = node_lookup.get(raw_src, raw_src)
-        tgt_tbl = node_lookup.get(raw_tgt, raw_tgt)
+        # 【移除容错映射】直接使用原始 raw_src 和 raw_tgt
+        src_tbl = raw_src
+        tgt_tbl = raw_tgt
         src_f = row.get('SourceField', '')
         tgt_f = row.get('TargetField', '')
         table_fields.setdefault(src_tbl, set()).add(src_f)
         table_fields.setdefault(tgt_tbl, set()).add(tgt_f)
 
     # 确保每个表都有占位
-    for tbl in set(node_lookup.values()):
+    for tbl in all_table_names:
         if tbl not in table_fields:
             table_fields[tbl] = set()
 
     col_width = 150
     col_gap = 200
-    field_height =32
+    field_height = 32
     field_gap = 8
     start_x = 100
     start_y = 60
@@ -198,7 +198,7 @@ def build_field_view_elements(tables, flows, expansions=None):
     x_cursor = start_x
 
     # 生成节点
-    for tbl_name in sorted(set(node_lookup.values())):
+    for tbl_name in sorted(all_table_names):
         all_fields = sorted(list(table_fields.get(tbl_name, [])))
         total = len(all_fields)
         expanded = expansions.get(tbl_name, False)
@@ -215,19 +215,16 @@ def build_field_view_elements(tables, flows, expansions=None):
         parent_height = header_height + n * field_height + (n - 1) * field_gap + 30 + extra_height
         parent_width = col_width
 
-# 修改后
         parent_nodes.append({
             'data': {
                 'id': tbl_name,
                 'label': tbl_name,
-                'category': table_category_map.get(tbl_name, 'source'),
-                # 不再需要 width/height
+                'category': table_category_map.get(tbl_name, 'source')
             },
             'position': {'x': x_cursor, 'y': start_y},
             'style': {
                 'width': parent_width,
                 'height': parent_height,
-                # 以下为原有样式，可自由调整颜色
                 'shape': 'round-rectangle',
                 'background-color': '#e8f4f8',
                 'border-width': 0,
@@ -262,7 +259,7 @@ def build_field_view_elements(tables, flows, expansions=None):
 
         x_cursor += col_width + col_gap
 
-    # 生成连线（绝对单向，利用 row.name 确保同名源字段连线不丢）
+    # 生成列级连线（绝对单向）
     for _, row in flows.iterrows():
         raw_src = str(row.get('SourceTable', '')).strip()
         raw_tgt = str(row.get('TargetTable', '')).strip()
@@ -272,11 +269,9 @@ def build_field_view_elements(tables, flows, expansions=None):
         if not raw_src or not raw_tgt or not src_f or not tgt_f:
             continue
         
-        src_tbl = node_lookup.get(raw_src, raw_src)
-        tgt_tbl = node_lookup.get(raw_tgt, raw_tgt)
-        
-        src_id = f"{src_tbl}.{src_f}"
-        tgt_id = f"{tgt_tbl}.{tgt_f}"
+        # 【移除容错映射】直接拼接
+        src_id = f"{raw_src}.{src_f}"
+        tgt_id = f"{raw_tgt}.{tgt_f}"
         
         field_edges.append({
             'data': {
@@ -309,7 +304,6 @@ field_stylesheet = [
     {'selector': 'edge:selected', 'style': {'line-color': '#0074D9', 'target-arrow-color': '#0074D9', 'width': 2, 'overlay-color': '#00BFFF', 'overlay-opacity': 0.5, 'overlay-padding': 4}},
 ]
 
-# ==================== 写入 Excel ====================
 def write_to_excel(tables, flows, steps, path):
     from openpyxl import Workbook
     wb = Workbook()
@@ -340,7 +334,6 @@ def write_to_excel(tables, flows, steps, path):
             ws.append([f.get('SourceTable',''), f.get('SourceField',''), f.get('TargetField',''), f.get('Rule',''), f.get('Notes','')])
     wb.save(path)
 
-# ==================== Dash App ====================
 app = dash.Dash(__name__)
 app.config.suppress_callback_exceptions = True
 
@@ -383,7 +376,6 @@ app.layout = html.Div([
     dcc.Store(id='field-expansions', data={}),
 ])
 
-# ==================== 回调函数 ====================
 @app.callback(
     Output('graph', 'elements'),
     Output('graph', 'stylesheet'),
@@ -409,7 +401,7 @@ def toggle_view(n_clicks, current_mode, dfs_dict, expansions):
     if current_mode == 'table':
         elements = build_field_view_elements(tables, flows, expansions)
         return (
-            elements, field_stylesheet, {'name': 'preset', 'fit': True, 'padding': 60},
+            elements, field_stylesheet, {'name': 'preset',  'fit': True, 'padding': 60},
             'field', 'Current: Column-level View', 'Switch to Table-level View',
             "Click a connection to view its rule", '', {'display': 'none'}, 
             {'display': 'block', 'padding': 10, 'border': '1px solid #ccc', 'borderRadius': 5}
@@ -417,7 +409,7 @@ def toggle_view(n_clicks, current_mode, dfs_dict, expansions):
     else:
         elements = build_table_elements(tables, flows)
         return (
-            elements, base_stylesheet, {'name': 'breadthfirst', 'spacingFactor': 1.2},
+            elements, base_stylesheet, {'name': 'breadthfirst', 'spacingFactor': 1.5, 'fit': True,'padding': 30},
             'table', 'Current: Table-level View', 'Switch to Column View',
             "Switch to column-level view to see field details", '', 
             {'display': 'block', 'padding': 10, 'border': '1px solid #ccc', 'borderRadius': 5}, 
@@ -508,7 +500,6 @@ def show_edit_panel(node_data, view_mode, dfs_dict):
         html.Button("Save Changes to Excel", id='save-btn', n_clicks=0, style={'marginTop': '15px', 'display': 'block'})
     ]), table
 
-# ==================== 列级视图回调 ====================
 @app.callback(
     Output('field-info-panel', 'children', allow_duplicate=True),
     Output('selected-edge', 'data'),
@@ -598,7 +589,7 @@ def save_field_rule(n_clicks, new_rule, selected_edge, dfs_dict, view_mode):
     return ('Rule saved!', 
             {'tables': tables.to_dict('records'), 'flows': flows.to_dict('records'), 'steps': steps.to_dict('records')},
             build_field_view_elements(tables, flows), field_stylesheet, 
-            {'name': 'preset','fit': True, 'padding': 60})
+            {'name': 'preset', 'fit': True, 'padding': 60})
 
 @app.callback(
     Output('save-status', 'children'),
